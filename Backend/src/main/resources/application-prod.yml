@@ -1,0 +1,110 @@
+spring:
+  application:
+    name: todolist-api
+
+  # PostgreSQL Database Configuration (Docker 환경)
+  datasource:
+    url: jdbc:postgresql://postgres:5432/todolist_db
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+
+  # JPA Configuration
+  jpa:
+    hibernate:
+      ddl-auto: none  # Flyway가 모든 스키마 관리, Hibernate는 관여하지 않음
+    show-sql: false  # 프로덕션에서는 SQL 로그 비활성화
+    properties:
+      hibernate:
+        format_sql: false
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        default_schema: todolist_db
+        jdbc:
+          lob:
+            non_contextual_creation: true
+    open-in-view: false
+
+  # Flyway Configuration (수동 Bean 등록 방식 사용)
+  flyway:
+    enabled: false  # AutoConfiguration 비활성화 (FlywayConfig.java에서 수동 설정)
+    baseline-on-migrate: true
+    baseline-version: 0
+    locations: classpath:db/migration
+    schemas: todolist_db
+    default-schema: todolist_db
+    validate-on-migrate: true
+    clean-disabled: true
+    create-schemas: true  # Flyway가 스키마 자동 생성
+
+  # Redis Configuration (Docker 환경)
+  data:
+    redis:
+      host: redis
+      port: 6379
+      password: ${REDIS_PASSWORD}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 10
+          max-idle: 5
+          min-idle: 2
+
+  # Security
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID}
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope:
+              - email
+              - profile
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+
+# JWT Configuration
+jwt:
+  secret: ${JWT_SECRET}
+  access-token-validity: ${JWT_ACCESS_EXPIRATION:3600000}  # 기본값 1시간
+  refresh-token-validity: ${JWT_REFRESH_EXPIRATION:604800000}  # 기본값 7일
+
+# Swagger Configuration (프로덕션에서는 비활성화 권장)
+springdoc:
+  api-docs:
+    enabled: false  # 프로덕션에서는 Swagger 비활성화
+  swagger-ui:
+    enabled: false
+
+# Actuator (최소한의 엔드포인트만 노출)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never  # 보안을 위해 상세 정보 숨김
+
+# Logging (프로덕션 레벨)
+logging:
+  level:
+    root: INFO
+    com.todolist: INFO
+    org.springframework.security: WARN
+    org.hibernate.SQL: WARN
+    org.flywaydb: DEBUG  # Flyway 상세 로그
+    org.springframework.boot.autoconfigure: DEBUG  # AutoConfiguration 상세 로그
+    org.springframework.boot.autoconfigure.flyway: DEBUG  # Flyway AutoConfig 전용
+
+# OAuth2 Frontend Redirect URL
+app:
+  oauth2:
+    redirect-uri: ${FRONTEND_URL}/auth/callback
+
+# CORS Configuration (환경 변수로 관리)
+cors:
+  allowed-origins: ${FRONTEND_URL}

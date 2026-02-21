@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew clean build:*)",
+      "Bash(npx create-next-app:*)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --app --src-dir --import-alias \"@/*\" --no-git --eslint)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --app --src-dir --import-alias \"@/*\")",
+      "Bash(npm install:*)",
+      "Bash(npm run build:*)",
+      "Bash(curl:*)",
+      "Bash(psql:*)",
+      "Bash(pg_isready:*)",
+      "Bash(./gradlew dependencies:*)",
+      "Bash(/Users/cby/projects/TodoList-project/Backend/schema_fix_enum_to_varchar.sql << 'EOF'\n-- =====================================================\n-- PostgreSQL ENUM to VARCHAR Migration Script\n-- =====================================================\n-- 목적: Hibernate 7.2.1과 PostgreSQL ENUM 타입 호환성 문제 해결\n-- 변경일: 2026-02-18\n-- \n-- 문제: Hibernate가 PostgreSQL ENUM 타입으로 매핑하지 못하고 VARCHAR로 전송하여 타입 불일치 에러 발생\n-- 해결: ENUM 타입을 VARCHAR로 변경하여 Hibernate의 기본 String 매핑 사용\n-- =====================================================\n\n-- 1. todos 테이블의 priority 컬럼을 priority_level ENUM에서 VARCHAR\\(10\\)으로 변경\nALTER TABLE todolist_db.todos \n  ALTER COLUMN priority TYPE VARCHAR\\(10\\);\n\n-- 2. todos 테이블의 status 컬럼을 todo_status ENUM에서 VARCHAR\\(20\\)으로 변경\nALTER TABLE todolist_db.todos \n  ALTER COLUMN status TYPE VARCHAR\\(20\\);\n\n-- 3. \\(선택사항\\) 사용하지 않는 ENUM 타입 삭제\n-- 주의: 다른 테이블에서 사용 중이면 에러 발생\n-- DROP TYPE IF EXISTS todolist_db.priority_level;\n-- DROP TYPE IF EXISTS todolist_db.todo_status;\n\n-- =====================================================\n-- 검증 쿼리\n-- =====================================================\n-- 변경 후 테이블 구조 확인\n-- \\\\d todolist_db.todos\n\n-- 변경된 컬럼 타입 확인\n-- SELECT column_name, data_type, character_maximum_length \n-- FROM information_schema.columns \n-- WHERE table_schema = 'todolist_db' \n--   AND table_name = 'todos' \n--   AND column_name IN \\('priority', 'status'\\);\nEOF)",
+      "Bash(sudo -u postgres psql:*)",
+      "Bash(/Users/cby/projects/TodoList-project/Backend/schema_fix_enum_to_varchar.sql << 'EOF'\n-- =====================================================\n-- PostgreSQL ENUM to VARCHAR Migration Script\n-- =====================================================\n-- 목적: Hibernate 7.2.1과 PostgreSQL ENUM 타입 호환성 문제 해결\n-- 변경일: 2026-02-18\n-- \n-- 문제: Hibernate가 PostgreSQL ENUM 타입으로 매핑하지 못하고 VARCHAR로 전송하여 타입 불일치 에러 발생\n-- 해결: ENUM 타입을 VARCHAR로 변경하여 Hibernate의 기본 String 매핑 사용\n-- =====================================================\n\n-- Step 1: 의존하는 뷰 삭제\nDROP VIEW IF EXISTS todolist_db.v_trash_todos;\n\n-- Step 2: 의존하는 트리거 삭제\nDROP TRIGGER IF EXISTS tg_todos_completed_at ON todolist_db.todos;\n\n-- Step 3: 컬럼 타입 변경\nALTER TABLE todolist_db.todos \n  ALTER COLUMN priority TYPE VARCHAR\\(10\\);\n\nALTER TABLE todolist_db.todos \n  ALTER COLUMN status TYPE VARCHAR\\(20\\);\n\n-- Step 4: 트리거 재생성\nCREATE TRIGGER tg_todos_completed_at \n  BEFORE UPDATE ON todolist_db.todos \n  FOR EACH ROW \n  WHEN \\(old.status IS DISTINCT FROM new.status\\) \n  EXECUTE FUNCTION todolist_db.update_completed_at\\(\\);\n\n-- Step 5: 뷰 재생성\nCREATE OR REPLACE VIEW todolist_db.v_trash_todos AS\n  SELECT \n    t.todo_id,\n    t.user_id,\n    t.title,\n    t.description,\n    t.category_id,\n    c.name AS category_name,\n    t.priority,\n    t.status,\n    t.deleted_at,\n    EXTRACT\\(day FROM CURRENT_TIMESTAMP - t.deleted_at::timestamp with time zone\\)::integer AS days_in_trash,\n    GREATEST\\(0, 30 - EXTRACT\\(day FROM CURRENT_TIMESTAMP - t.deleted_at::timestamp with time zone\\)::integer\\) AS days_until_permanent_delete\n  FROM todolist_db.todos t\n    LEFT JOIN todolist_db.categories c ON c.category_id = t.category_id\n  WHERE t.is_deleted = true\n  ORDER BY t.deleted_at DESC;\n\n-- Step 6: \\(선택사항\\) 사용하지 않는 ENUM 타입 삭제\n-- DROP TYPE IF EXISTS todolist_db.priority_level;\n-- DROP TYPE IF EXISTS todolist_db.todo_status;\n\n-- =====================================================\n-- 검증 쿼리\n-- =====================================================\n-- 변경된 컬럼 타입 확인\nSELECT column_name, data_type, character_maximum_length \nFROM information_schema.columns \nWHERE table_schema = 'todolist_db' \n  AND table_name = 'todos' \n  AND column_name IN \\('priority', 'status'\\);\nEOF)",
+      "Bash(pg_dump:*)",
+      "Bash(/Users/cby/projects/TodoList-project/Backend/README_SCHEMA.md << 'EOF'\n# 데이터베이스 스키마 관리\n\n## 파일 구조\n\n### 1. `schema_initial.sql`\n- **용도**: DB 공장초기화 시 사용하는 전체 스키마\n- **내용**: 테이블, 뷰, 함수, 트리거, 인덱스 등 모든 오브젝트\n- **실행 방법**: `psql -d todolist_db -f schema_initial.sql`\n- **주의**: 이 파일은 이미 ENUM → VARCHAR 변환이 적용된 최신 스키마입니다\n\n### 2. `schema_fix_enum_to_varchar.sql`\n- **용도**: 기존 DB에 ENUM 타입이 있을 때 VARCHAR로 마이그레이션\n- **실행 시점**: 이미 운영 중인 DB에 적용할 때만 사용\n- **실행 방법**: `psql -d todolist_db -f schema_fix_enum_to_varchar.sql`\n\n## DB 공장초기화 방법\n\n### 방법 1: 전체 재생성 \\(권장\\)\n\n```bash\n# 1. 기존 DB 삭제 \\(주의: 모든 데이터 삭제됨\\)\ndropdb todolist_db\n\n# 2. DB 재생성\ncreatedb todolist_db\n\n# 3. 초기 스키마 적용\npsql -d todolist_db -f Backend/schema_initial.sql\n```\n\n### 방법 2: 스키마만 재생성\n\n```bash\n# 1. 기존 스키마 삭제\npsql -d todolist_db -c \"DROP SCHEMA IF EXISTS todolist_db CASCADE;\"\n\n# 2. 초기 스키마 적용\npsql -d todolist_db -f Backend/schema_initial.sql\n```\n\n## 중요 사항\n\n### ❌ 잘못된 방법\n```bash\n# 이렇게 하지 마세요!\npsql -d todolist_db -f old_schema_with_enum.sql        # ENUM으로 생성\npsql -d todolist_db -f schema_fix_enum_to_varchar.sql  # VARCHAR로 변환 \\(불필요한 작업\\)\n```\n\n### ✅ 올바른 방법\n```bash\n# schema_initial.sql은 이미 VARCHAR로 되어 있으므로 바로 사용\npsql -d todolist_db -f schema_initial.sql\n```\n\n## 스키마 업데이트 시\n\n새로운 변경사항이 있을 때:\n1. `schema_initial.sql` 파일을 직접 수정\n2. 운영 DB에는 마이그레이션 스크립트 작성하여 적용\n3. 공장초기화는 항상 최신 `schema_initial.sql` 사용\n\nEOF)",
+      "Bash(./gradlew test:*)",
+      "Bash(PGPASSWORD='MySecure2026!Password' psql:*)",
+      "Bash(PGPASSWORD='MySecure2026!Password' pg_dump:*)",
+      "Bash(timeout 30 ./gradlew bootRun:*)",
+      "Bash(timeout 35 ./gradlew bootRun:*)",
+      "Bash(tee:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(TOKEN=\"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIiwiaWF0IjoxNzcxNDAwNTUyLCJleHAiOjE3NzE0MDQxNTJ9.uTWtCXUy9_2nLsJGEJ_Gn49H5itxlcZKhcBW2YCUrEg\")",
+      "Bash(redis-cli:*)",
+      "Bash(./gradlew build:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

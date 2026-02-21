@@ -1,0 +1,51 @@
+# ================================
+# DB 서버 - PostgreSQL
+# ================================
+# 실행 순서: 1. DB 서버 먼저 시작
+# 명령어: docker-compose -f docker-compose.db.yml up -d
+# 또는: make up
+
+version: '3.8'
+
+services:
+  # ================================
+  # PostgreSQL Database
+  # ================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: todolist-db  # 앱 서버에서 접근 시 사용
+    env_file:
+      - .env.db
+    environment:
+      - POSTGRES_DB=todolist_db
+      - POSTGRES_USER=${DB_USERNAME}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=C
+    ports:
+      - "5432:5432"  # 앱 서버에서 접근용
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d todolist_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - todolist-network
+
+# ================================
+# Named Volumes
+# ================================
+volumes:
+  postgres_data:
+    driver: local
+
+# ================================
+# Networks
+# ================================
+networks:
+  todolist-network:
+    driver: bridge
+    name: todolist-network  # 명시적 이름 설정

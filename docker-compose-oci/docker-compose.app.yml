@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # ================================
+  # Nginx (Reverse Proxy)
+  # ================================
+  nginx:
+    image: nginx:alpine
+    container_name: todolist-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+    networks:
+      - todolist-network
+
+  # ================================
+  # Frontend (Next.js)
+  # ================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ""
+    container_name: todolist-frontend
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - todolist-network
+
+  # ================================
+  # Backend (Spring Boot)
+  # ================================
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: todolist-backend
+    env_file:
+      - .env
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://10.0.0.71:5432/todolist_db
+      - SPRING_DATASOURCE_USERNAME=${DB_USERNAME}
+      - SPRING_DATASOURCE_PASSWORD=${DB_PASSWORD}
+      - SPRING_DATA_REDIS_HOST=10.0.0.71
+      - SPRING_DATA_REDIS_PORT=6379
+      - SPRING_DATA_REDIS_PASSWORD=${REDIS_PASSWORD}
+      - SPRING_FLYWAY_ENABLED=false
+      - SPRING_FLYWAY_LOCATIONS=classpath:db/migration
+      - SPRING_FLYWAY_SCHEMAS=todolist_db
+      - SPRING_FLYWAY_DEFAULT_SCHEMA=todolist_db
+      - SPRING_FLYWAY_CREATE_SCHEMAS=true
+      - SPRING_FLYWAY_BASELINE_ON_MIGRATE=true
+      - SPRING_FLYWAY_BASELINE_VERSION=0
+      - LOGGING_LEVEL_ORG_FLYWAYDB=DEBUG
+      - LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_BOOT_AUTOCONFIGURE=DEBUG
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_ACCESS_TOKEN_VALIDITY=${JWT_ACCESS_EXPIRATION}
+      - JWT_REFRESH_TOKEN_VALIDITY=${JWT_REFRESH_EXPIRATION}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL}
+    restart: unless-stopped
+    networks:
+      - todolist-network
+
+# ================================
+# Networks
+# ================================
+networks:
+  todolist-network:
+    driver: bridge

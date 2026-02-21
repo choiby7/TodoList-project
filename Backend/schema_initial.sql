@@ -1,0 +1,2866 @@
+--
+-- PostgreSQL database dump
+--
+
+\restrict jrg5rBLCiHeRmljNyvM4pAmvudSrkHYOastKAgZK8AHM1URs897WddTOJbXhQsN
+
+-- Dumped from database version 18.2 (Homebrew)
+-- Dumped by pg_dump version 18.2 (Homebrew)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: todolist_db; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA todolist_db;
+
+
+--
+-- Name: SCHEMA todolist_db; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON SCHEMA todolist_db IS 'TodoList 서비스 전용 스키마 — public 스키마 미사용';
+
+
+--
+-- Name: activity_type; Type: TYPE; Schema: todolist_db; Owner: -
+--
+
+CREATE TYPE todolist_db.activity_type AS ENUM (
+    'CREATE',
+    'UPDATE',
+    'DELETE',
+    'COMPLETE',
+    'REOPEN'
+);
+
+
+--
+-- Name: priority_level; Type: TYPE; Schema: todolist_db; Owner: -
+--
+
+
+
+--
+-- Name: todo_status; Type: TYPE; Schema: todolist_db; Owner: -
+--
+
+
+
+--
+-- Name: cleanup_expired_tokens(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.cleanup_expired_tokens() RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_deleted INTEGER;
+BEGIN
+    DELETE FROM todolist_db.refresh_tokens
+    WHERE expires_at < CURRENT_TIMESTAMP OR is_revoked = TRUE;
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RAISE NOTICE '[cleanup_expired_tokens] % 건 삭제 (%)', v_deleted, CURRENT_TIMESTAMP;
+    RETURN v_deleted;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION cleanup_expired_tokens(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.cleanup_expired_tokens() IS '만료/폐기된 Refresh Token 삭제 | 권장 주기: 매일 00:00';
+
+
+--
+-- Name: cleanup_old_activity_logs(integer); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.cleanup_old_activity_logs(p_days integer DEFAULT 90) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_deleted INTEGER;
+    v_cutoff  TIMESTAMP;
+BEGIN
+    v_cutoff := CURRENT_TIMESTAMP - (p_days || ' days')::INTERVAL;
+
+    DELETE FROM todolist_db.activity_logs WHERE created_at < v_cutoff;
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RAISE NOTICE '[cleanup_old_activity_logs] %일 이전 로그 % 건 삭제 (%)',
+                 p_days, v_deleted, CURRENT_TIMESTAMP;
+    RETURN v_deleted;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION cleanup_old_activity_logs(p_days integer); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.cleanup_old_activity_logs(p_days integer) IS '지정 일수(기본 90일) 이전 활동 로그 삭제 | 권장 주기: 매일 00:05';
+
+
+--
+-- Name: create_next_month_partition(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.create_next_month_partition() RETURNS text
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_next_month     DATE;
+    v_month_after    DATE;
+    v_partition_name TEXT;
+    v_sql            TEXT;
+BEGIN
+    v_next_month     := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '1 month');
+    v_month_after    := v_next_month + INTERVAL '1 month';
+    v_partition_name := 'activity_logs_' || TO_CHAR(v_next_month, 'YYYY_MM');
+
+    v_sql := FORMAT(
+        'CREATE TABLE IF NOT EXISTS todolist_db.%I '
+        'PARTITION OF todolist_db.activity_logs '
+        'FOR VALUES FROM (%L) TO (%L)',
+        v_partition_name, v_next_month, v_month_after
+    );
+    EXECUTE v_sql;
+
+    RAISE NOTICE '[create_next_month_partition] 파티션 생성: % (%)',
+                 v_partition_name, CURRENT_TIMESTAMP;
+    RETURN v_partition_name;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION create_next_month_partition(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.create_next_month_partition() IS '다음 달 activity_logs 파티션 자동 생성 | 권장 주기: 매월 1일 00:00';
+
+
+--
+-- Name: empty_trash(integer); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.empty_trash(p_days integer DEFAULT 30) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_deleted INTEGER;
+    v_cutoff  TIMESTAMP;
+BEGIN
+    v_cutoff := CURRENT_TIMESTAMP - (p_days || ' days')::INTERVAL;
+
+    DELETE FROM todolist_db.todos
+    WHERE is_deleted = TRUE AND deleted_at < v_cutoff;
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RAISE NOTICE '[empty_trash] 휴지통 %일 초과 % 건 영구 삭제 (%)',
+                 p_days, v_deleted, CURRENT_TIMESTAMP;
+    RETURN v_deleted;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION empty_trash(p_days integer); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.empty_trash(p_days integer) IS '휴지통 p_days일 초과 Todo 영구 삭제 | 권장 주기: 매일 00:10';
+
+
+--
+-- Name: refresh_statistics(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.refresh_statistics() RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    ANALYZE todolist_db.users;
+    ANALYZE todolist_db.categories;
+    ANALYZE todolist_db.todos;
+    ANALYZE todolist_db.tags;
+    ANALYZE todolist_db.todo_tags;
+    ANALYZE todolist_db.attachments;
+    ANALYZE todolist_db.comments;
+    ANALYZE todolist_db.refresh_tokens;
+    RAISE NOTICE '[refresh_statistics] 통계 갱신 완료 (%)', CURRENT_TIMESTAMP;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION refresh_statistics(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.refresh_statistics() IS '전체 테이블 통계 갱신 (쿼리 플래너 최적화) | 권장 주기: 매주 일요일 00:00';
+
+
+--
+-- Name: reset_failed_login_on_success(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.reset_failed_login_on_success() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.last_login_at IS NOT NULL
+       AND (OLD.last_login_at IS NULL OR NEW.last_login_at != OLD.last_login_at)
+    THEN
+        NEW.failed_login_attempts = 0;
+        NEW.locked_until          = NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION reset_failed_login_on_success(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.reset_failed_login_on_success() IS '로그인 성공(last_login_at 갱신) 시 실패 카운터 초기화 및 잠금 해제';
+
+
+--
+-- Name: unlock_expired_accounts(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.unlock_expired_accounts() RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_unlocked INTEGER;
+BEGIN
+    UPDATE todolist_db.users
+       SET locked_until = NULL
+     WHERE locked_until IS NOT NULL AND locked_until < CURRENT_TIMESTAMP;
+
+    GET DIAGNOSTICS v_unlocked = ROW_COUNT;
+    IF v_unlocked > 0 THEN
+        RAISE NOTICE '[unlock_expired_accounts] % 계정 잠금 해제 (%)',
+                     v_unlocked, CURRENT_TIMESTAMP;
+    END IF;
+    RETURN v_unlocked;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION unlock_expired_accounts(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.unlock_expired_accounts() IS '잠금 시각 만료 계정 자동 해제 | 권장 주기: 매시간';
+
+
+--
+-- Name: update_completed_at(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.update_completed_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status = 'COMPLETED' AND OLD.status != 'COMPLETED' THEN
+        NEW.completed_at = CURRENT_TIMESTAMP;
+    ELSIF NEW.status != 'COMPLETED' AND OLD.status = 'COMPLETED' THEN
+        NEW.completed_at = NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: update_deleted_at(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.update_deleted_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.is_deleted = TRUE AND OLD.is_deleted = FALSE THEN
+        NEW.deleted_at = CURRENT_TIMESTAMP;
+    ELSIF NEW.is_deleted = FALSE AND OLD.is_deleted = TRUE THEN
+        NEW.deleted_at = NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION update_deleted_at(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.update_deleted_at() IS 'is_deleted 변경 시 deleted_at 자동 설정 / 해제';
+
+
+--
+-- Name: update_updated_at_column(); Type: FUNCTION; Schema: todolist_db; Owner: -
+--
+
+CREATE FUNCTION todolist_db.update_updated_at_column() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION update_updated_at_column(); Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON FUNCTION todolist_db.update_updated_at_column() IS 'UPDATE 실행 시 updated_at을 현재 시각으로 자동 갱신';
+
+
+SET default_tablespace = '';
+
+--
+-- Name: activity_logs; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs (
+    log_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+)
+PARTITION BY RANGE (created_at);
+
+
+--
+-- Name: TABLE activity_logs; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.activity_logs IS '사용자 활동 로그 (월별 파티셔닝, 90일 보관)';
+
+
+--
+-- Name: COLUMN activity_logs.metadata; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.activity_logs.metadata IS '변경 전/후 값 등 추가 정보 (JSONB)';
+
+
+--
+-- Name: COLUMN activity_logs.ip_address; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.activity_logs.ip_address IS '요청 IP 주소 (보안 추적)';
+
+
+--
+-- Name: COLUMN activity_logs.user_agent; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.activity_logs.user_agent IS '요청 User-Agent (보안 추적)';
+
+
+--
+-- Name: activity_logs_log_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.activity_logs_log_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: activity_logs_log_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.activity_logs_log_id_seq OWNED BY todolist_db.activity_logs.log_id;
+
+
+SET default_table_access_method = heap;
+
+--
+-- Name: activity_logs_2026_01; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_01 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_02; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_02 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_03; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_03 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_04; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_04 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_05; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_05 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_06; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_06 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_07; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_07 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_08; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_08 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_09; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_09 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_10; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_10 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_11; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_11 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2026_12; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2026_12 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2027_01; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2027_01 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2027_02; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2027_02 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: activity_logs_2027_03; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.activity_logs_2027_03 (
+    log_id bigint DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass) CONSTRAINT activity_logs_log_id_not_null NOT NULL,
+    user_id bigint CONSTRAINT activity_logs_user_id_not_null NOT NULL,
+    todo_id bigint,
+    activity_type todolist_db.activity_type CONSTRAINT activity_logs_activity_type_not_null NOT NULL,
+    description text,
+    metadata jsonb,
+    ip_address inet,
+    user_agent text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP CONSTRAINT activity_logs_created_at_not_null NOT NULL
+);
+
+
+--
+-- Name: attachments; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.attachments (
+    attachment_id bigint NOT NULL,
+    todo_id bigint NOT NULL,
+    file_name character varying(255) NOT NULL,
+    file_path character varying(500) NOT NULL,
+    file_size bigint NOT NULL,
+    file_type character varying(100),
+    uploaded_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT chk_attachments_file_size CHECK (((file_size > 0) AND (file_size <= 10485760)))
+);
+
+
+--
+-- Name: TABLE attachments; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.attachments IS '할 일 첨부파일';
+
+
+--
+-- Name: COLUMN attachments.file_path; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.attachments.file_path IS 'S3 버킷 내 경로 (예: uploads/1/uuid.pdf)';
+
+
+--
+-- Name: COLUMN attachments.file_size; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.attachments.file_size IS '파일 크기 (bytes), 최대 10MB';
+
+
+--
+-- Name: attachments_attachment_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.attachments_attachment_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: attachments_attachment_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.attachments_attachment_id_seq OWNED BY todolist_db.attachments.attachment_id;
+
+
+--
+-- Name: categories; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.categories (
+    category_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    name character varying(50) NOT NULL,
+    color_code character varying(7) DEFAULT '#3B82F6'::character varying NOT NULL,
+    icon character varying(50),
+    display_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT chk_categories_color_format CHECK (((color_code)::text ~* '^#[0-9A-Fa-f]{6}$'::text)),
+    CONSTRAINT chk_categories_name_length CHECK (((length((name)::text) >= 1) AND (length((name)::text) <= 50)))
+);
+
+
+--
+-- Name: TABLE categories; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.categories IS '사용자 정의 카테고리';
+
+
+--
+-- Name: COLUMN categories.color_code; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.categories.color_code IS 'HEX 색상 코드 (#RRGGBB)';
+
+
+--
+-- Name: COLUMN categories.icon; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.categories.icon IS 'Emoji 또는 아이콘 식별자';
+
+
+--
+-- Name: categories_category_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.categories_category_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: categories_category_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.categories_category_id_seq OWNED BY todolist_db.categories.category_id;
+
+
+--
+-- Name: comments; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.comments (
+    comment_id bigint NOT NULL,
+    todo_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    content text NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT chk_comments_content_length CHECK (((length(content) >= 1) AND (length(content) <= 2000)))
+);
+
+
+--
+-- Name: TABLE comments; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.comments IS '할 일 댓글 / 메모';
+
+
+--
+-- Name: comments_comment_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.comments_comment_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: comments_comment_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.comments_comment_id_seq OWNED BY todolist_db.comments.comment_id;
+
+
+--
+-- Name: refresh_tokens; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.refresh_tokens (
+    token_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    token character varying(500) NOT NULL,
+    expires_at timestamp without time zone NOT NULL,
+    is_revoked boolean DEFAULT false NOT NULL,
+    ip_address inet,
+    user_agent text,
+    last_used_at timestamp without time zone,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT chk_refresh_tokens_expiry CHECK ((expires_at > created_at))
+);
+
+
+--
+-- Name: TABLE refresh_tokens; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.refresh_tokens IS 'JWT Refresh Token 관리';
+
+
+--
+-- Name: COLUMN refresh_tokens.is_revoked; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.refresh_tokens.is_revoked IS '폐기 여부 (로그아웃 시 TRUE)';
+
+
+--
+-- Name: COLUMN refresh_tokens.ip_address; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.refresh_tokens.ip_address IS '토큰 발급 IP (보안 추적)';
+
+
+--
+-- Name: COLUMN refresh_tokens.user_agent; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.refresh_tokens.user_agent IS '토큰 발급 User-Agent (보안 추적)';
+
+
+--
+-- Name: COLUMN refresh_tokens.last_used_at; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.refresh_tokens.last_used_at IS '마지막 토큰 사용 시각';
+
+
+--
+-- Name: refresh_tokens_token_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.refresh_tokens_token_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: refresh_tokens_token_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.refresh_tokens_token_id_seq OWNED BY todolist_db.refresh_tokens.token_id;
+
+
+--
+-- Name: tags; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.tags (
+    tag_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    name character varying(50) NOT NULL,
+    color_code character varying(7) DEFAULT '#6B7280'::character varying NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT chk_tags_color_format CHECK (((color_code)::text ~* '^#[0-9A-Fa-f]{6}$'::text)),
+    CONSTRAINT chk_tags_name_length CHECK (((length((name)::text) >= 1) AND (length((name)::text) <= 50)))
+);
+
+
+--
+-- Name: TABLE tags; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.tags IS '재사용 가능한 태그';
+
+
+--
+-- Name: tags_tag_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.tags_tag_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: tags_tag_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.tags_tag_id_seq OWNED BY todolist_db.tags.tag_id;
+
+
+--
+-- Name: todo_tags; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.todo_tags (
+    todo_id bigint NOT NULL,
+    tag_id bigint NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: TABLE todo_tags; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.todo_tags IS 'Todo ↔ Tag 다대다 관계 테이블';
+
+
+--
+-- Name: todos; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.todos (
+    todo_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    category_id bigint,
+    title character varying(200) NOT NULL,
+    description text,
+    priority character varying(10) DEFAULT 'MEDIUM' NOT NULL,
+    due_date timestamp without time zone,
+    reminder_at timestamp without time zone,
+    is_important boolean DEFAULT false NOT NULL,
+    is_deleted boolean DEFAULT false NOT NULL,
+    display_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    completed_at timestamp without time zone,
+    deleted_at timestamp without time zone,
+    status character varying(20) CONSTRAINT todos_status_new_not_null NOT NULL,
+    CONSTRAINT chk_todos_description_length CHECK (((description IS NULL) OR (length(description) <= 5000))),
+    CONSTRAINT chk_todos_reminder_before_due CHECK (((reminder_at IS NULL) OR (due_date IS NULL) OR (reminder_at <= due_date))),
+    CONSTRAINT chk_todos_title_length CHECK (((length((title)::text) >= 1) AND (length((title)::text) <= 200)))
+);
+
+
+--
+-- Name: TABLE todos; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.todos IS '할 일 (소프트 삭제 지원)';
+
+
+--
+-- Name: COLUMN todos.is_deleted; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.todos.is_deleted IS '소프트 삭제 플래그 (TRUE = 휴지통)';
+
+
+--
+-- Name: COLUMN todos.completed_at; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.todos.completed_at IS '완료 처리 시각 (트리거 자동 설정)';
+
+
+--
+-- Name: COLUMN todos.deleted_at; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.todos.deleted_at IS '휴지통 이동 시각 (30일 후 자동 영구 삭제)';
+
+
+--
+-- Name: todos_todo_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.todos_todo_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: todos_todo_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.todos_todo_id_seq OWNED BY todolist_db.todos.todo_id;
+
+
+--
+-- Name: users; Type: TABLE; Schema: todolist_db; Owner: -
+--
+
+CREATE TABLE todolist_db.users (
+    user_id bigint NOT NULL,
+    email character varying(255) NOT NULL,
+    password_hash character varying(255) NOT NULL,
+    username character varying(100) NOT NULL,
+    profile_image_url character varying(500),
+    is_active boolean DEFAULT true NOT NULL,
+    email_verified boolean DEFAULT false NOT NULL,
+    failed_login_attempts integer DEFAULT 0 NOT NULL,
+    locked_until timestamp without time zone,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_login_at timestamp without time zone,
+    CONSTRAINT chk_users_email_format CHECK (((email)::text ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'::text)),
+    CONSTRAINT chk_users_failed_attempts CHECK (((failed_login_attempts >= 0) AND (failed_login_attempts <= 10))),
+    CONSTRAINT chk_users_username_length CHECK (((length((username)::text) >= 2) AND (length((username)::text) <= 100)))
+);
+
+
+--
+-- Name: TABLE users; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON TABLE todolist_db.users IS '사용자 계정';
+
+
+--
+-- Name: COLUMN users.password_hash; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.users.password_hash IS 'BCrypt 해시 (강도 10-12), 평문 저장 금지';
+
+
+--
+-- Name: COLUMN users.email_verified; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.users.email_verified IS '이메일 인증 여부';
+
+
+--
+-- Name: COLUMN users.failed_login_attempts; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.users.failed_login_attempts IS 'Brute Force 방어 카운터 (5회 초과 시 15분 잠금)';
+
+
+--
+-- Name: COLUMN users.locked_until; Type: COMMENT; Schema: todolist_db; Owner: -
+--
+
+COMMENT ON COLUMN todolist_db.users.locked_until IS '계정 잠금 해제 시각 (NULL = 잠금 없음)';
+
+
+--
+-- Name: users_user_id_seq; Type: SEQUENCE; Schema: todolist_db; Owner: -
+--
+
+CREATE SEQUENCE todolist_db.users_user_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: users_user_id_seq; Type: SEQUENCE OWNED BY; Schema: todolist_db; Owner: -
+--
+
+ALTER SEQUENCE todolist_db.users_user_id_seq OWNED BY todolist_db.users.user_id;
+
+
+--
+-- Name: v_category_todo_count; Type: VIEW; Schema: todolist_db; Owner: -
+--
+
+CREATE VIEW todolist_db.v_category_todo_count AS
+ SELECT c.category_id,
+    c.user_id,
+    c.name AS category_name,
+    c.color_code,
+    c.icon,
+    c.display_order,
+    count(t.todo_id) AS total_count,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'COMPLETED'::text)) AS completed_count,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'IN_PROGRESS'::text)) AS in_progress_count,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'TODO'::text)) AS pending_count
+   FROM (todolist_db.categories c
+     LEFT JOIN todolist_db.todos t ON (((t.category_id = c.category_id) AND (t.is_deleted = false))))
+  GROUP BY c.category_id, c.user_id, c.name, c.color_code, c.icon, c.display_order
+  ORDER BY c.display_order;
+
+
+--
+-- Name: v_trash_todos; Type: VIEW; Schema: todolist_db; Owner: -
+--
+
+CREATE VIEW todolist_db.v_trash_todos AS
+ SELECT t.todo_id,
+    t.user_id,
+    t.title,
+    t.description,
+    t.category_id,
+    c.name AS category_name,
+    t.priority,
+    t.status,
+    t.deleted_at,
+    (EXTRACT(day FROM (CURRENT_TIMESTAMP - (t.deleted_at)::timestamp with time zone)))::integer AS days_in_trash,
+    GREATEST(0, (30 - (EXTRACT(day FROM (CURRENT_TIMESTAMP - (t.deleted_at)::timestamp with time zone)))::integer)) AS days_until_permanent_delete
+   FROM (todolist_db.todos t
+     LEFT JOIN todolist_db.categories c ON ((c.category_id = t.category_id)))
+  WHERE (t.is_deleted = true)
+  ORDER BY t.deleted_at DESC;
+
+
+--
+-- Name: v_user_todo_stats; Type: VIEW; Schema: todolist_db; Owner: -
+--
+
+CREATE VIEW todolist_db.v_user_todo_stats AS
+ SELECT u.user_id,
+    u.username,
+    u.email,
+    count(t.todo_id) AS total_todos,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'COMPLETED'::text)) AS completed_todos,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'IN_PROGRESS'::text)) AS in_progress_todos,
+    count(t.todo_id) FILTER (WHERE ((t.status)::text = 'TODO'::text)) AS pending_todos,
+    count(t.todo_id) FILTER (WHERE ((t.due_date < CURRENT_TIMESTAMP) AND ((t.status)::text <> 'COMPLETED'::text))) AS overdue_todos,
+    count(t.todo_id) FILTER (WHERE (date(t.due_date) = CURRENT_DATE)) AS today_todos,
+    count(t.todo_id) FILTER (WHERE (t.is_important = true)) AS important_todos,
+    round(((100.0 * (count(t.todo_id) FILTER (WHERE ((t.status)::text = 'COMPLETED'::text)))::numeric) / (NULLIF(count(t.todo_id), 0))::numeric), 2) AS completion_rate
+   FROM (todolist_db.users u
+     LEFT JOIN todolist_db.todos t ON (((t.user_id = u.user_id) AND (t.is_deleted = false))))
+  GROUP BY u.user_id, u.username, u.email;
+
+
+--
+-- Name: activity_logs_2026_01; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_01 FOR VALUES FROM ('2026-01-01 00:00:00') TO ('2026-02-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_02; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_02 FOR VALUES FROM ('2026-02-01 00:00:00') TO ('2026-03-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_03; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_03 FOR VALUES FROM ('2026-03-01 00:00:00') TO ('2026-04-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_04; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_04 FOR VALUES FROM ('2026-04-01 00:00:00') TO ('2026-05-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_05; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_05 FOR VALUES FROM ('2026-05-01 00:00:00') TO ('2026-06-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_06; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_06 FOR VALUES FROM ('2026-06-01 00:00:00') TO ('2026-07-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_07; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_07 FOR VALUES FROM ('2026-07-01 00:00:00') TO ('2026-08-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_08; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_08 FOR VALUES FROM ('2026-08-01 00:00:00') TO ('2026-09-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_09; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_09 FOR VALUES FROM ('2026-09-01 00:00:00') TO ('2026-10-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_10; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_10 FOR VALUES FROM ('2026-10-01 00:00:00') TO ('2026-11-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_11; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_11 FOR VALUES FROM ('2026-11-01 00:00:00') TO ('2026-12-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2026_12; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2026_12 FOR VALUES FROM ('2026-12-01 00:00:00') TO ('2027-01-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2027_01; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2027_01 FOR VALUES FROM ('2027-01-01 00:00:00') TO ('2027-02-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2027_02; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2027_02 FOR VALUES FROM ('2027-02-01 00:00:00') TO ('2027-03-01 00:00:00');
+
+
+--
+-- Name: activity_logs_2027_03; Type: TABLE ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ATTACH PARTITION todolist_db.activity_logs_2027_03 FOR VALUES FROM ('2027-03-01 00:00:00') TO ('2027-04-01 00:00:00');
+
+
+--
+-- Name: activity_logs log_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs ALTER COLUMN log_id SET DEFAULT nextval('todolist_db.activity_logs_log_id_seq'::regclass);
+
+
+--
+-- Name: attachments attachment_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.attachments ALTER COLUMN attachment_id SET DEFAULT nextval('todolist_db.attachments_attachment_id_seq'::regclass);
+
+
+--
+-- Name: categories category_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.categories ALTER COLUMN category_id SET DEFAULT nextval('todolist_db.categories_category_id_seq'::regclass);
+
+
+--
+-- Name: comments comment_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.comments ALTER COLUMN comment_id SET DEFAULT nextval('todolist_db.comments_comment_id_seq'::regclass);
+
+
+--
+-- Name: refresh_tokens token_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.refresh_tokens ALTER COLUMN token_id SET DEFAULT nextval('todolist_db.refresh_tokens_token_id_seq'::regclass);
+
+
+--
+-- Name: tags tag_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.tags ALTER COLUMN tag_id SET DEFAULT nextval('todolist_db.tags_tag_id_seq'::regclass);
+
+
+--
+-- Name: todos todo_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todos ALTER COLUMN todo_id SET DEFAULT nextval('todolist_db.todos_todo_id_seq'::regclass);
+
+
+--
+-- Name: users user_id; Type: DEFAULT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.users ALTER COLUMN user_id SET DEFAULT nextval('todolist_db.users_user_id_seq'::regclass);
+
+
+--
+-- Name: activity_logs activity_logs_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs
+    ADD CONSTRAINT activity_logs_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_01 activity_logs_2026_01_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_01
+    ADD CONSTRAINT activity_logs_2026_01_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_02 activity_logs_2026_02_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_02
+    ADD CONSTRAINT activity_logs_2026_02_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_03 activity_logs_2026_03_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_03
+    ADD CONSTRAINT activity_logs_2026_03_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_04 activity_logs_2026_04_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_04
+    ADD CONSTRAINT activity_logs_2026_04_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_05 activity_logs_2026_05_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_05
+    ADD CONSTRAINT activity_logs_2026_05_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_06 activity_logs_2026_06_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_06
+    ADD CONSTRAINT activity_logs_2026_06_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_07 activity_logs_2026_07_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_07
+    ADD CONSTRAINT activity_logs_2026_07_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_08 activity_logs_2026_08_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_08
+    ADD CONSTRAINT activity_logs_2026_08_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_09 activity_logs_2026_09_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_09
+    ADD CONSTRAINT activity_logs_2026_09_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_10 activity_logs_2026_10_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_10
+    ADD CONSTRAINT activity_logs_2026_10_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_11 activity_logs_2026_11_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_11
+    ADD CONSTRAINT activity_logs_2026_11_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2026_12 activity_logs_2026_12_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2026_12
+    ADD CONSTRAINT activity_logs_2026_12_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2027_01 activity_logs_2027_01_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2027_01
+    ADD CONSTRAINT activity_logs_2027_01_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2027_02 activity_logs_2027_02_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2027_02
+    ADD CONSTRAINT activity_logs_2027_02_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: activity_logs_2027_03 activity_logs_2027_03_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.activity_logs_2027_03
+    ADD CONSTRAINT activity_logs_2027_03_pkey PRIMARY KEY (log_id, created_at);
+
+
+--
+-- Name: attachments attachments_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.attachments
+    ADD CONSTRAINT attachments_pkey PRIMARY KEY (attachment_id);
+
+
+--
+-- Name: categories categories_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.categories
+    ADD CONSTRAINT categories_pkey PRIMARY KEY (category_id);
+
+
+--
+-- Name: comments comments_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.comments
+    ADD CONSTRAINT comments_pkey PRIMARY KEY (comment_id);
+
+
+--
+-- Name: refresh_tokens refresh_tokens_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.refresh_tokens
+    ADD CONSTRAINT refresh_tokens_pkey PRIMARY KEY (token_id);
+
+
+--
+-- Name: tags tags_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.tags
+    ADD CONSTRAINT tags_pkey PRIMARY KEY (tag_id);
+
+
+--
+-- Name: todo_tags todo_tags_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todo_tags
+    ADD CONSTRAINT todo_tags_pkey PRIMARY KEY (todo_id, tag_id);
+
+
+--
+-- Name: todos todos_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todos
+    ADD CONSTRAINT todos_pkey PRIMARY KEY (todo_id);
+
+
+--
+-- Name: categories uq_categories_user_name; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.categories
+    ADD CONSTRAINT uq_categories_user_name UNIQUE (user_id, name);
+
+
+--
+-- Name: refresh_tokens uq_refresh_tokens_token; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.refresh_tokens
+    ADD CONSTRAINT uq_refresh_tokens_token UNIQUE (token);
+
+
+--
+-- Name: tags uq_tags_user_name; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.tags
+    ADD CONSTRAINT uq_tags_user_name UNIQUE (user_id, name);
+
+
+--
+-- Name: users uq_users_email; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.users
+    ADD CONSTRAINT uq_users_email UNIQUE (email);
+
+
+--
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.users
+    ADD CONSTRAINT users_pkey PRIMARY KEY (user_id);
+
+
+--
+-- Name: idx_activity_logs_created_at; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_activity_logs_created_at ON ONLY todolist_db.activity_logs USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_01_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_01_created_at_idx ON todolist_db.activity_logs_2026_01 USING btree (created_at DESC);
+
+
+--
+-- Name: idx_activity_logs_metadata; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_activity_logs_metadata ON ONLY todolist_db.activity_logs USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_01_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_01_metadata_idx ON todolist_db.activity_logs_2026_01 USING gin (metadata);
+
+
+--
+-- Name: idx_activity_logs_todo_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_activity_logs_todo_id ON ONLY todolist_db.activity_logs USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_01_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_01_todo_id_idx ON todolist_db.activity_logs_2026_01 USING btree (todo_id);
+
+
+--
+-- Name: idx_activity_logs_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_activity_logs_user_id ON ONLY todolist_db.activity_logs USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_01_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_01_user_id_idx ON todolist_db.activity_logs_2026_01 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_02_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_02_created_at_idx ON todolist_db.activity_logs_2026_02 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_02_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_02_metadata_idx ON todolist_db.activity_logs_2026_02 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_02_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_02_todo_id_idx ON todolist_db.activity_logs_2026_02 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_02_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_02_user_id_idx ON todolist_db.activity_logs_2026_02 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_03_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_03_created_at_idx ON todolist_db.activity_logs_2026_03 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_03_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_03_metadata_idx ON todolist_db.activity_logs_2026_03 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_03_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_03_todo_id_idx ON todolist_db.activity_logs_2026_03 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_03_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_03_user_id_idx ON todolist_db.activity_logs_2026_03 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_04_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_04_created_at_idx ON todolist_db.activity_logs_2026_04 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_04_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_04_metadata_idx ON todolist_db.activity_logs_2026_04 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_04_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_04_todo_id_idx ON todolist_db.activity_logs_2026_04 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_04_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_04_user_id_idx ON todolist_db.activity_logs_2026_04 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_05_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_05_created_at_idx ON todolist_db.activity_logs_2026_05 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_05_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_05_metadata_idx ON todolist_db.activity_logs_2026_05 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_05_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_05_todo_id_idx ON todolist_db.activity_logs_2026_05 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_05_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_05_user_id_idx ON todolist_db.activity_logs_2026_05 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_06_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_06_created_at_idx ON todolist_db.activity_logs_2026_06 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_06_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_06_metadata_idx ON todolist_db.activity_logs_2026_06 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_06_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_06_todo_id_idx ON todolist_db.activity_logs_2026_06 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_06_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_06_user_id_idx ON todolist_db.activity_logs_2026_06 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_07_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_07_created_at_idx ON todolist_db.activity_logs_2026_07 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_07_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_07_metadata_idx ON todolist_db.activity_logs_2026_07 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_07_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_07_todo_id_idx ON todolist_db.activity_logs_2026_07 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_07_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_07_user_id_idx ON todolist_db.activity_logs_2026_07 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_08_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_08_created_at_idx ON todolist_db.activity_logs_2026_08 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_08_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_08_metadata_idx ON todolist_db.activity_logs_2026_08 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_08_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_08_todo_id_idx ON todolist_db.activity_logs_2026_08 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_08_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_08_user_id_idx ON todolist_db.activity_logs_2026_08 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_09_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_09_created_at_idx ON todolist_db.activity_logs_2026_09 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_09_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_09_metadata_idx ON todolist_db.activity_logs_2026_09 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_09_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_09_todo_id_idx ON todolist_db.activity_logs_2026_09 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_09_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_09_user_id_idx ON todolist_db.activity_logs_2026_09 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_10_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_10_created_at_idx ON todolist_db.activity_logs_2026_10 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_10_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_10_metadata_idx ON todolist_db.activity_logs_2026_10 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_10_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_10_todo_id_idx ON todolist_db.activity_logs_2026_10 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_10_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_10_user_id_idx ON todolist_db.activity_logs_2026_10 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_11_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_11_created_at_idx ON todolist_db.activity_logs_2026_11 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_11_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_11_metadata_idx ON todolist_db.activity_logs_2026_11 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_11_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_11_todo_id_idx ON todolist_db.activity_logs_2026_11 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_11_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_11_user_id_idx ON todolist_db.activity_logs_2026_11 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2026_12_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_12_created_at_idx ON todolist_db.activity_logs_2026_12 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2026_12_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_12_metadata_idx ON todolist_db.activity_logs_2026_12 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2026_12_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_12_todo_id_idx ON todolist_db.activity_logs_2026_12 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2026_12_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2026_12_user_id_idx ON todolist_db.activity_logs_2026_12 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2027_01_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_01_created_at_idx ON todolist_db.activity_logs_2027_01 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2027_01_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_01_metadata_idx ON todolist_db.activity_logs_2027_01 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2027_01_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_01_todo_id_idx ON todolist_db.activity_logs_2027_01 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2027_01_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_01_user_id_idx ON todolist_db.activity_logs_2027_01 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2027_02_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_02_created_at_idx ON todolist_db.activity_logs_2027_02 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2027_02_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_02_metadata_idx ON todolist_db.activity_logs_2027_02 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2027_02_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_02_todo_id_idx ON todolist_db.activity_logs_2027_02 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2027_02_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_02_user_id_idx ON todolist_db.activity_logs_2027_02 USING btree (user_id);
+
+
+--
+-- Name: activity_logs_2027_03_created_at_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_03_created_at_idx ON todolist_db.activity_logs_2027_03 USING btree (created_at DESC);
+
+
+--
+-- Name: activity_logs_2027_03_metadata_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_03_metadata_idx ON todolist_db.activity_logs_2027_03 USING gin (metadata);
+
+
+--
+-- Name: activity_logs_2027_03_todo_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_03_todo_id_idx ON todolist_db.activity_logs_2027_03 USING btree (todo_id);
+
+
+--
+-- Name: activity_logs_2027_03_user_id_idx; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX activity_logs_2027_03_user_id_idx ON todolist_db.activity_logs_2027_03 USING btree (user_id);
+
+
+--
+-- Name: idx_attachments_todo_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_attachments_todo_id ON todolist_db.attachments USING btree (todo_id);
+
+
+--
+-- Name: idx_categories_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_categories_user_id ON todolist_db.categories USING btree (user_id);
+
+
+--
+-- Name: idx_categories_user_order; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_categories_user_order ON todolist_db.categories USING btree (user_id, display_order);
+
+
+--
+-- Name: idx_comments_created_at; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_comments_created_at ON todolist_db.comments USING btree (created_at DESC);
+
+
+--
+-- Name: idx_comments_todo_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_comments_todo_id ON todolist_db.comments USING btree (todo_id);
+
+
+--
+-- Name: idx_comments_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_comments_user_id ON todolist_db.comments USING btree (user_id);
+
+
+--
+-- Name: idx_refresh_tokens_active; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_refresh_tokens_active ON todolist_db.refresh_tokens USING btree (user_id, expires_at) WHERE (is_revoked = false);
+
+
+--
+-- Name: idx_refresh_tokens_expires; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_refresh_tokens_expires ON todolist_db.refresh_tokens USING btree (expires_at);
+
+
+--
+-- Name: idx_refresh_tokens_token; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_refresh_tokens_token ON todolist_db.refresh_tokens USING btree (token);
+
+
+--
+-- Name: idx_refresh_tokens_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_refresh_tokens_user_id ON todolist_db.refresh_tokens USING btree (user_id);
+
+
+--
+-- Name: idx_tags_name; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_tags_name ON todolist_db.tags USING btree (name);
+
+
+--
+-- Name: idx_tags_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_tags_user_id ON todolist_db.tags USING btree (user_id);
+
+
+--
+-- Name: idx_todo_tags_tag_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todo_tags_tag_id ON todolist_db.todo_tags USING btree (tag_id);
+
+
+--
+-- Name: idx_todo_tags_todo_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todo_tags_todo_id ON todolist_db.todo_tags USING btree (todo_id);
+
+
+--
+-- Name: idx_todos_category_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_category_id ON todolist_db.todos USING btree (category_id) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_todos_created_at; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_created_at ON todolist_db.todos USING btree (created_at DESC);
+
+
+--
+-- Name: idx_todos_due_date; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_due_date ON todolist_db.todos USING btree (due_date) WHERE ((due_date IS NOT NULL) AND (is_deleted = false));
+
+
+--
+-- Name: idx_todos_fulltext_search; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_fulltext_search ON todolist_db.todos USING gin (to_tsvector('simple'::regconfig, (((title)::text || ' '::text) || COALESCE(description, ''::text)))) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_todos_important; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_important ON todolist_db.todos USING btree (user_id, is_important) WHERE ((is_important = true) AND (is_deleted = false));
+
+
+--
+-- Name: idx_todos_priority; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_priority ON todolist_db.todos USING btree (priority) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_todos_trash; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_trash ON todolist_db.todos USING btree (user_id, deleted_at) WHERE (is_deleted = true);
+
+
+--
+-- Name: idx_todos_user_category; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_user_category ON todolist_db.todos USING btree (user_id, category_id) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_todos_user_due_date; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_user_due_date ON todolist_db.todos USING btree (user_id, due_date) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_todos_user_id; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_todos_user_id ON todolist_db.todos USING btree (user_id) WHERE (is_deleted = false);
+
+
+--
+-- Name: idx_users_created_at; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_users_created_at ON todolist_db.users USING btree (created_at DESC);
+
+
+--
+-- Name: idx_users_email; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_users_email ON todolist_db.users USING btree (email);
+
+
+--
+-- Name: idx_users_email_unverified; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_users_email_unverified ON todolist_db.users USING btree (email_verified) WHERE (email_verified = false);
+
+
+--
+-- Name: idx_users_locked; Type: INDEX; Schema: todolist_db; Owner: -
+--
+
+CREATE INDEX idx_users_locked ON todolist_db.users USING btree (locked_until) WHERE (locked_until IS NOT NULL);
+
+
+--
+-- Name: activity_logs_2026_01_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_01_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_01_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_01_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_01_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_01_pkey;
+
+
+--
+-- Name: activity_logs_2026_01_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_01_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_01_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_01_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_02_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_02_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_02_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_02_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_02_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_02_pkey;
+
+
+--
+-- Name: activity_logs_2026_02_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_02_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_02_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_02_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_03_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_03_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_03_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_03_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_03_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_03_pkey;
+
+
+--
+-- Name: activity_logs_2026_03_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_03_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_03_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_03_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_04_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_04_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_04_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_04_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_04_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_04_pkey;
+
+
+--
+-- Name: activity_logs_2026_04_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_04_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_04_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_04_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_05_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_05_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_05_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_05_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_05_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_05_pkey;
+
+
+--
+-- Name: activity_logs_2026_05_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_05_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_05_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_05_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_06_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_06_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_06_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_06_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_06_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_06_pkey;
+
+
+--
+-- Name: activity_logs_2026_06_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_06_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_06_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_06_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_07_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_07_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_07_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_07_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_07_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_07_pkey;
+
+
+--
+-- Name: activity_logs_2026_07_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_07_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_07_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_07_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_08_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_08_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_08_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_08_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_08_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_08_pkey;
+
+
+--
+-- Name: activity_logs_2026_08_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_08_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_08_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_08_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_09_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_09_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_09_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_09_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_09_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_09_pkey;
+
+
+--
+-- Name: activity_logs_2026_09_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_09_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_09_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_09_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_10_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_10_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_10_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_10_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_10_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_10_pkey;
+
+
+--
+-- Name: activity_logs_2026_10_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_10_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_10_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_10_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_11_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_11_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_11_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_11_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_11_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_11_pkey;
+
+
+--
+-- Name: activity_logs_2026_11_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_11_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_11_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_11_user_id_idx;
+
+
+--
+-- Name: activity_logs_2026_12_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2026_12_created_at_idx;
+
+
+--
+-- Name: activity_logs_2026_12_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2026_12_metadata_idx;
+
+
+--
+-- Name: activity_logs_2026_12_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2026_12_pkey;
+
+
+--
+-- Name: activity_logs_2026_12_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2026_12_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2026_12_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2026_12_user_id_idx;
+
+
+--
+-- Name: activity_logs_2027_01_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2027_01_created_at_idx;
+
+
+--
+-- Name: activity_logs_2027_01_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2027_01_metadata_idx;
+
+
+--
+-- Name: activity_logs_2027_01_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2027_01_pkey;
+
+
+--
+-- Name: activity_logs_2027_01_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2027_01_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2027_01_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2027_01_user_id_idx;
+
+
+--
+-- Name: activity_logs_2027_02_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2027_02_created_at_idx;
+
+
+--
+-- Name: activity_logs_2027_02_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2027_02_metadata_idx;
+
+
+--
+-- Name: activity_logs_2027_02_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2027_02_pkey;
+
+
+--
+-- Name: activity_logs_2027_02_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2027_02_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2027_02_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2027_02_user_id_idx;
+
+
+--
+-- Name: activity_logs_2027_03_created_at_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_created_at ATTACH PARTITION todolist_db.activity_logs_2027_03_created_at_idx;
+
+
+--
+-- Name: activity_logs_2027_03_metadata_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_metadata ATTACH PARTITION todolist_db.activity_logs_2027_03_metadata_idx;
+
+
+--
+-- Name: activity_logs_2027_03_pkey; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.activity_logs_pkey ATTACH PARTITION todolist_db.activity_logs_2027_03_pkey;
+
+
+--
+-- Name: activity_logs_2027_03_todo_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_todo_id ATTACH PARTITION todolist_db.activity_logs_2027_03_todo_id_idx;
+
+
+--
+-- Name: activity_logs_2027_03_user_id_idx; Type: INDEX ATTACH; Schema: todolist_db; Owner: -
+--
+
+ALTER INDEX todolist_db.idx_activity_logs_user_id ATTACH PARTITION todolist_db.activity_logs_2027_03_user_id_idx;
+
+
+--
+-- Name: categories tg_categories_updated_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_categories_updated_at BEFORE UPDATE ON todolist_db.categories FOR EACH ROW EXECUTE FUNCTION todolist_db.update_updated_at_column();
+
+
+--
+-- Name: comments tg_comments_updated_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_comments_updated_at BEFORE UPDATE ON todolist_db.comments FOR EACH ROW EXECUTE FUNCTION todolist_db.update_updated_at_column();
+
+
+--
+-- Name: todos tg_todos_completed_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_todos_completed_at BEFORE UPDATE ON todolist_db.todos FOR EACH ROW WHEN (((old.status)::text IS DISTINCT FROM (new.status)::text)) EXECUTE FUNCTION todolist_db.update_completed_at();
+
+
+--
+-- Name: todos tg_todos_deleted_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_todos_deleted_at BEFORE UPDATE ON todolist_db.todos FOR EACH ROW WHEN ((old.is_deleted IS DISTINCT FROM new.is_deleted)) EXECUTE FUNCTION todolist_db.update_deleted_at();
+
+
+--
+-- Name: todos tg_todos_updated_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_todos_updated_at BEFORE UPDATE ON todolist_db.todos FOR EACH ROW EXECUTE FUNCTION todolist_db.update_updated_at_column();
+
+
+--
+-- Name: users tg_users_reset_failed_login; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_users_reset_failed_login BEFORE UPDATE ON todolist_db.users FOR EACH ROW EXECUTE FUNCTION todolist_db.reset_failed_login_on_success();
+
+
+--
+-- Name: users tg_users_updated_at; Type: TRIGGER; Schema: todolist_db; Owner: -
+--
+
+CREATE TRIGGER tg_users_updated_at BEFORE UPDATE ON todolist_db.users FOR EACH ROW EXECUTE FUNCTION todolist_db.update_updated_at_column();
+
+
+--
+-- Name: activity_logs activity_logs_todo_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE todolist_db.activity_logs
+    ADD CONSTRAINT activity_logs_todo_id_fkey FOREIGN KEY (todo_id) REFERENCES todolist_db.todos(todo_id) ON DELETE SET NULL;
+
+
+--
+-- Name: activity_logs activity_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE todolist_db.activity_logs
+    ADD CONSTRAINT activity_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: attachments attachments_todo_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.attachments
+    ADD CONSTRAINT attachments_todo_id_fkey FOREIGN KEY (todo_id) REFERENCES todolist_db.todos(todo_id) ON DELETE CASCADE;
+
+
+--
+-- Name: categories categories_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.categories
+    ADD CONSTRAINT categories_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: comments comments_todo_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.comments
+    ADD CONSTRAINT comments_todo_id_fkey FOREIGN KEY (todo_id) REFERENCES todolist_db.todos(todo_id) ON DELETE CASCADE;
+
+
+--
+-- Name: comments comments_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.comments
+    ADD CONSTRAINT comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: refresh_tokens refresh_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.refresh_tokens
+    ADD CONSTRAINT refresh_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tags tags_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.tags
+    ADD CONSTRAINT tags_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: todo_tags todo_tags_tag_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todo_tags
+    ADD CONSTRAINT todo_tags_tag_id_fkey FOREIGN KEY (tag_id) REFERENCES todolist_db.tags(tag_id) ON DELETE CASCADE;
+
+
+--
+-- Name: todo_tags todo_tags_todo_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todo_tags
+    ADD CONSTRAINT todo_tags_todo_id_fkey FOREIGN KEY (todo_id) REFERENCES todolist_db.todos(todo_id) ON DELETE CASCADE;
+
+
+--
+-- Name: todos todos_category_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todos
+    ADD CONSTRAINT todos_category_id_fkey FOREIGN KEY (category_id) REFERENCES todolist_db.categories(category_id) ON DELETE SET NULL;
+
+
+--
+-- Name: todos todos_user_id_fkey; Type: FK CONSTRAINT; Schema: todolist_db; Owner: -
+--
+
+ALTER TABLE ONLY todolist_db.todos
+    ADD CONSTRAINT todos_user_id_fkey FOREIGN KEY (user_id) REFERENCES todolist_db.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict jrg5rBLCiHeRmljNyvM4pAmvudSrkHYOastKAgZK8AHM1URs897WddTOJbXhQsN
+
