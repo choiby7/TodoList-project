@@ -51,11 +51,11 @@ help:
 # 전체 시작 (올바른 순서: DB 먼저, 앱 나중)
 up:
 	@echo "🚀 DB 서버 시작 중..."
-	docker compose -f docker-compose.db.yml up -d
+	docker compose --env-file .env.db -f docker-compose.db.yml up -d
 	@echo "⏳ DB 서버 헬스체크 대기 중..."
 	@sleep 5
 	@echo "🚀 앱 서버 시작 중..."
-	docker compose -f docker-compose.app.yml up -d
+	docker compose --env-file .env.app -f docker-compose.app.yml up -d
 	@echo "✅ 전체 스택 시작 완료!"
 	@echo ""
 	@echo "접속 정보:"
@@ -67,15 +67,15 @@ up:
 # 전체 중지
 down:
 	@echo "🛑 앱 서버 중지 중..."
-	docker compose -f docker-compose.app.yml down
+	docker compose --env-file .env.app -f docker-compose.app.yml down
 	@echo "🛑 DB 서버 중지 중..."
-	docker compose -f docker-compose.db.yml down
+	docker compose --env-file .env.db -f docker-compose.db.yml down
 	@echo "✅ 전체 스택 중지 완료!"
 
 # 전체 로그 확인 (실시간)
 logs:
 	@echo "📋 전체 로그 확인 중... (Ctrl+C로 종료)"
-	docker compose -f docker-compose.db.yml -f docker-compose.app.yml logs -f
+	docker compose --env-file .env.db -f docker-compose.db.yml --env-file .env.app -f docker-compose.app.yml logs -f
 
 # 전체 재시작
 restart: down up
@@ -85,22 +85,22 @@ status:
 	@echo "================================"
 	@echo "DB 서버 상태"
 	@echo "================================"
-	docker compose -f docker-compose.db.yml ps
+	docker compose --env-file .env.db -f docker-compose.db.yml ps
 	@echo ""
 	@echo "================================"
 	@echo "앱 서버 상태"
 	@echo "================================"
-	docker compose -f docker-compose.app.yml ps
+	docker compose --env-file .env.app -f docker-compose.app.yml ps
 
 # 전체 이미지 빌드
 build:
 	@echo "🔨 이미지 빌드 중..."
-	docker compose -f docker-compose.app.yml build
+	docker compose --env-file .env.app -f docker-compose.app.yml build
 
 # 캐시 없이 재빌드
 rebuild:
 	@echo "🔨 캐시 없이 재빌드 중..."
-	docker compose -f docker-compose.app.yml build --no-cache
+	docker compose --env-file .env.app -f docker-compose.app.yml build --no-cache
 
 # 전체 중지 + 볼륨 삭제 (데이터 삭제 주의!)
 clean:
@@ -109,9 +109,9 @@ clean:
 	echo; \
 	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
 		echo "🗑️  앱 서버 중지 + 볼륨 삭제 중..."; \
-		docker compose -f docker-compose.app.yml down -v; \
+		docker compose --env-file .env.app -f docker-compose.app.yml down -v; \
 		echo "🗑️  DB 서버 중지 + 볼륨 삭제 중..."; \
-		docker compose -f docker-compose.db.yml down -v; \
+		docker compose --env-file .env.db -f docker-compose.db.yml down -v; \
 		echo "✅ 전체 정리 완료!"; \
 	else \
 		echo "❌ 취소되었습니다."; \
@@ -123,17 +123,17 @@ clean:
 
 up-db:
 	@echo "🚀 DB 서버 시작 중..."
-	docker compose -f docker-compose.db.yml up -d
+	docker compose --env-file .env.db -f docker-compose.db.yml up -d
 	@echo "✅ DB 서버 시작 완료!"
 
 down-db:
 	@echo "🛑 DB 서버 중지 중..."
-	docker compose -f docker-compose.db.yml down
+	docker compose --env-file .env.db -f docker-compose.db.yml down
 	@echo "✅ DB 서버 중지 완료!"
 
 logs-db:
 	@echo "📋 DB 서버 로그 확인 중... (Ctrl+C로 종료)"
-	docker compose -f docker-compose.db.yml logs -f
+	docker compose --env-file .env.db -f docker-compose.db.yml logs -f
 
 # ================================
 # 앱 서버 전용 명령어
@@ -141,14 +141,14 @@ logs-db:
 
 up-app:
 	@echo "🚀 앱 서버 시작 중..."
-	docker compose -f docker-compose.app.yml up -d
+	docker compose --env-file .env.app -f docker-compose.app.yml up -d
 	@echo "✅ 앱 서버 시작 완료!"
 
 down-app:
 	@echo "🛑 앱 서버 중지 중..."
-	docker compose -f docker-compose.app.yml down
+	docker compose --env-file .env.app -f docker-compose.app.yml down
 	@echo "✅ 앱 서버 중지 완료!"
 
 logs-app:
 	@echo "📋 앱 서버 로그 확인 중... (Ctrl+C로 종료)"
-	docker compose -f docker-compose.app.yml logs -f
+	docker compose --env-file .env.app -f docker-compose.app.yml logs -f
