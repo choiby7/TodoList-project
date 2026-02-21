@@ -137,9 +137,11 @@ volumes:
     driver: local
 
 # ================================
-# Networks (external 참조)
+# Networks (앱 서버 자체 생성)
 # ================================
+# 프로덕션: DB 서버와 앱 서버가 물리적으로 다른 머신
+# DB 연결은 SPRING_DATASOURCE_URL의 IP로 하므로 네트워크 공유 불필요
 networks:
   todolist-network:
-    external: true
+    driver: bridge
     name: todolist-network

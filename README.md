@@ -94,8 +94,9 @@ cp .env.db.example .env.db
 make up-db
 
 # 앱 서버에서
-cp .env.app.prod.example .env.app
-# .env.app 편집 (실제 비밀번호, 도메인 설정)
+cp .env.app.example .env.app
+# .env.app 편집 (실제 비밀번호, DB IP 주소, 도메인 설정)
+# SPRING_DATASOURCE_URL에 DB 서버 IP 입력 필요
 make up-app
 ```
 
