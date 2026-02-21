@@ -97,6 +97,8 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
       - FRONTEND_URL=${FRONTEND_URL}
+      # Reverse Proxy 헤더 신뢰 설정 (X-Forwarded-* 헤더로 HTTPS 인식)
+      - SERVER_FORWARD_HEADERS_STRATEGY=native
     depends_on:
       redis:
         condition: service_healthy
