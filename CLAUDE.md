@@ -999,9 +999,106 @@ npm run test:coverage
 
 ## 🎯 현재 프로젝트 상태
 
-> 최종 업데이트: 2026-02-19 14:00
+> 최종 업데이트: 2026-02-21 18:00
 
-### ✅ 최근 완료 작업 (2026-02-19)
+### ✅ 최근 완료 작업 (2026-02-21)
+
+#### HTTPS 적용 완료 - Let's Encrypt SSL 인증서 ⭐⭐⭐ (18:00 완료)
+**달성 내용**
+- Let's Encrypt SSL 인증서 적용
+- HTTP → HTTPS 자동 리다이렉트
+- Spring Boot Reverse Proxy 헤더 신뢰 설정
+- OAuth2 HTTPS 리다이렉트 URI 생성 수정
+
+**주요 작업**
+
+1. **docker-compose.app.yml 수정**
+   - nginx 포트 443 추가 (HTTPS)
+   - Let's Encrypt 인증서 볼륨 마운트 (`/etc/letsencrypt:/etc/letsencrypt:ro`)
+   - Backend 환경변수 추가: `SERVER_FORWARD_HEADERS_STRATEGY=native`
+
+2. **nginx.conf 전면 재작성**
+   - HTTP 서버 (포트 80): HTTPS 301 리다이렉트
+   - HTTPS 서버 (포트 443): SSL 터미네이션 + 실제 서비스
+   - SSL 설정: TLS 1.2/1.3, HTTP/2 지원
+   - 보안 헤더: HSTS, X-Frame-Options, X-XSS-Protection, CSP
+   - X-Forwarded-Host 헤더 추가 (모든 프록시 location)
+
+3. **.env.app.example 업데이트**
+   - `FRONTEND_URL`: `http://localhost` → `https://cbytodolist.duckdns.org`
+   - CORS 및 OAuth2 리다이렉트 URL HTTPS 적용
+
+4. **Spring Boot Reverse Proxy 설정**
+   - `SERVER_FORWARD_HEADERS_STRATEGY=native` 환경변수 추가
+   - X-Forwarded-Proto, X-Forwarded-Host 헤더 신뢰 설정
+   - OAuth2 redirect URI를 https://로 올바르게 생성하도록 수정
+
+**보안 강화**
+- TLS 1.2/1.3 프로토콜 사용
+- 강력한 암호화 스위트 적용
+- HSTS (1년간 HTTPS 강제)
+- XSS, Clickjacking 방지 헤더
+- Let's Encrypt 자동 갱신 지원 (ACME challenge)
+
+**기술적 성과**
+- 전체 통신 암호화 (MITM 공격 방지)
+- OAuth2 보안 요구사항 충족
+- HTTP/2 성능 향상
+- 브라우저 신뢰 (자물쇠 아이콘)
+- SEO 개선 (HTTPS 선호)
+
+**배포 요구사항**
+- 프로덕션 서버 `.env.app` 파일 수정 필요
+- Google OAuth2 리다이렉트 URI 업데이트 필요
+- Docker 컨테이너 재시작 필요
+
+---
+
+### ✅ 이전 완료 작업 (2026-02-21)
+
+#### 프로덕션 배포 완료 및 환경 설정 최적화 ⭐⭐⭐ (16:30 완료)
+**달성 내용**
+- Git 관리 범위를 프로젝트 전체로 확장
+- Docker Compose 2-서버 구조로 분리
+- 프로덕션 환경 배포 완료
+- 환경 변수 및 네트워크 설정 최적화
+
+**주요 작업**
+
+1. **Git 통합 관리 구조 구축**
+   - Backend/.git, frontend/.git 제거 (embedded repository 해결)
+   - 루트 저장소에서 전체 프로젝트 통합 관리
+   - GitHub 보안 스캔 통과 (OAuth2 Client ID/Secret 제거)
+   - Backend/.gitignore 추가 (build/, .gradle/ 제외)
+   - GitHub 저장소: https://github.com/choiby7/TodoList-project
+
+2. **Docker Compose 2-서버 구조 분리**
+   - docker-compose.db.yml (PostgreSQL 전용)
+   - docker-compose.app.yml (nginx, backend, frontend, redis)
+   - Makefile 생성 (편리한 실행 명령어)
+   - docker-compose → docker compose 명령어 변경 (V2)
+   - --env-file 옵션 추가 (명시적 환경 변수 파일 지정)
+
+3. **프로덕션 배포 대응**
+   - 네트워크 설정 수정 (external 제거, 자체 생성)
+   - DB_HOST 환경변수로 변경 (application-prod.yml, docker-compose.app.yml)
+   - PostgreSQL 환경변수 중복 및 덮어쓰기 문제 해결
+   - .env.db, .env.app 환경 변수 파일 분리
+
+4. **환경 변수 정리**
+   - .env.db.example: POSTGRES_USER, POSTGRES_PASSWORD 추가
+   - .env.app.example: DB_HOST 추가
+   - .env.app.prod.example 삭제 (불필요)
+
+**기술적 성과**
+- 프로덕션 환경 배포 성공 (DB 서버 + 앱 서버 분리)
+- Git clone 후 .env 파일만 설정하면 바로 실행 가능한 구조
+- 로컬/프로덕션 환경 완전 분리
+- 환경 변수 기반 동적 설정 (DB_HOST, FRONTEND_URL 등)
+
+---
+
+### ✅ 이전 완료 작업 (2026-02-19)
 
 #### Docker 로컬 배포 환경 구축 완료 ⭐⭐⭐ (14:00 완료)
 **달성 내용**
@@ -1603,12 +1700,13 @@ docker-compose exec backend sh -c "jar -tf app.jar | grep db/migration"
 4. ✅ **Flyway 안정화** (FlywayConfig.java 수동 Bean, V7 마이그레이션)
 5. ✅ **환경 변수 설정** (.env.example, DOCKER_SETUP.md)
 
-**Phase 4: 클라우드 배포** ⭐⭐⭐ (다음 우선순위)
-1. **Oracle Cloud VM 설정** - 인스턴스 생성, Docker 설치
-2. **운영 환경 설정** - 환경 변수, 보안 그룹, 방화벽
-3. **도메인 & SSL** - 도메인 연결, Let's Encrypt 인증서
-4. **nginx HTTPS** - SSL 설정, HTTP → HTTPS 리다이렉트
-5. **모니터링** - 로그 수집, 헬스 체크
+**Phase 4: 클라우드 배포** ✅ 대부분 완료 (2026-02-21)
+1. ✅ **Oracle Cloud VM 설정** - 인스턴스 생성, Docker 설치
+2. ✅ **운영 환경 설정** - 환경 변수, 보안 그룹, 방화벽
+3. ✅ **도메인 & SSL** - DuckDNS 도메인 연결, Let's Encrypt 인증서 발급
+4. ✅ **nginx HTTPS** - SSL 설정, HTTP → HTTPS 리다이렉트, 보안 헤더
+5. ✅ **Reverse Proxy 헤더 설정** - Spring Boot HTTPS 인식, OAuth2 리다이렉트 URI 수정
+6. ⏳ **모니터링** - 로그 수집, 헬스 체크 (선택사항)
 
 **Phase 5: 캐싱 & 테스트** (나중에)
 1. **Redis 캐싱** ⭐⭐ - 카테고리, 통계 캐싱
@@ -1620,7 +1718,7 @@ docker-compose exec backend sh -c "jar -tf app.jar | grep db/migration"
 2. **다크모드 & 반응형** ⭐ - UI 개선
 
 ### 📊 전체 진행률
-**약 92%** (상세: [PROJECT_STATUS.md](./docs/PROJECT_STATUS.md))
+**약 95%** (상세: [PROJECT_STATUS.md](./docs/PROJECT_STATUS.md))
 
 **주요 완료 기능**:
 - ✅ 인증/인가 (JWT + OAuth2 + 블랙리스트)
@@ -1631,12 +1729,14 @@ docker-compose exec backend sh -c "jar -tf app.jar | grep db/migration"
 - ✅ Optimistic Updates
 - ✅ Docker 로컬 배포 (5개 서비스 컨테이너화)
 - ✅ Flyway 마이그레이션 (7개 버전)
+- ✅ **프로덕션 배포** (Oracle Cloud, 2-서버 구조)
+- ✅ **HTTPS 적용** (Let's Encrypt SSL, TLS 1.2/1.3, HTTP/2)
 
 **남은 작업**:
-- ⏳ **클라우드 배포** (Oracle Cloud) - 다음 우선순위
-- ⏳ 캐싱 (Redis)
+- ⏳ 캐싱 (Redis) - 카테고리, 통계
 - ⏳ 통계 대시보드
 - ⏳ 테스트 확장
+- ⏳ 모니터링 (선택사항)
 
 ---
 
