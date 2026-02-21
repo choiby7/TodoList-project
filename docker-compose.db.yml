@@ -18,15 +18,13 @@ services:
       - .env.db
     environment:
       - POSTGRES_DB=todolist_db
-      - POSTGRES_USER=${DB_USERNAME}
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
       - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=C
     ports:
       - "5432:5432"  # 앱 서버에서 접근용
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d todolist_db"]
+      test: ["CMD-SHELL", "pg_isready -U todolist_app -d todolist_db"]
       interval: 10s
       timeout: 5s
       retries: 5
