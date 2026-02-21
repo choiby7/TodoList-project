@@ -3,8 +3,10 @@ spring:
     name: todolist-api
 
   # PostgreSQL Database Configuration (Docker 환경)
+  # 프로덕션: DB_HOST 환경변수에 DB 서버 IP 입력 (예: 168.107.29.127)
+  # 로컬: DB_HOST 미설정 시 localhost 사용
   datasource:
-    url: jdbc:postgresql://postgres:5432/todolist_db
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/todolist_db
     driver-class-name: org.postgresql.Driver
     username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
