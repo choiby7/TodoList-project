@@ -72,7 +72,7 @@ services:
       - .env.app
     environment:
       - SPRING_PROFILES_ACTIVE=prod
-      - SPRING_DATASOURCE_URL=jdbc:postgresql://todolist-db:5432/todolist_db
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://${DB_HOST}:5432/todolist_db
       - SPRING_DATASOURCE_USERNAME=${DB_USERNAME}
       - SPRING_DATASOURCE_PASSWORD=${DB_PASSWORD}
       - SPRING_DATA_REDIS_HOST=redis
